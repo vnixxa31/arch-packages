@@ -1,0 +1,83 @@
+name: build-packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Package directory to build (empty = all)"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths: ["*/PKGBUILD"]
+
+# One build at a time so two runs never fight over the database.
+# A newer queued run replaces an older queued one, so the latest commit wins.
+concurrency:
+  group: pacman-repo
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  REPO_NAME: vnixxa31
+  RELEASE_TAG: x86_64
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PKG: ${{ inputs.package }}
+    steps:
+      - name: Install tools
+        run: pacman -Syu --noconfirm --needed git github-cli
+
+      - uses: actions/checkout@v4
+
+      - name: Create unprivileged build user (makepkg refuses to run as root)
+        run: |
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          chown -R builder: "$GITHUB_WORKSPACE"
+
+      - name: Download current repo contents
+        run: |
+          mkdir -p repo
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --title "pacman repo ($RELEASE_TAG)" \
+              --notes "Package repository storage. Not a software release."
+          gh release download "$RELEASE_TAG" --dir repo || true
+
+      - name: Build packages
+        run: |
+          mkdir -p out && chown builder: out
+          if [ -n "$PKG" ]; then pkgs="$PKG"
+          else pkgs=$(find . -mindepth 2 -maxdepth 2 -name PKGBUILD -printf '%h\n' | sed 's|^\./||'); fi
+          for p in $pkgs; do
+            (cd "$p" && sudo -u builder -H env PKGDEST="$GITHUB_WORKSPACE/out" \
+              makepkg -s --noconfirm --cleanbuild)
+          done
+
+      - name: Update repo database
+        run: |
+          cp out/*.pkg.tar.zst repo/
+          cd repo
+          rm -f "$REPO_NAME.db" "$REPO_NAME.files"
+          repo-add --remove "$REPO_NAME.db.tar.gz" $(cd ../out && ls *.pkg.tar.zst)
+          # GitHub releases can't store symlinks; replace them with real copies
+          for f in "$REPO_NAME.db" "$REPO_NAME.files"; do
+            cp --remove-destination "$(readlink -f "$f")" "$f"
+          done
+
+      - name: Publish and prune old files
+        run: |
+          cd repo
+          gh release upload "$RELEASE_TAG" *.pkg.tar.zst --clobber
+          gh release upload "$RELEASE_TAG" "$REPO_NAME".db* "$REPO_NAME".files* --clobber
+          for a in $(gh release view "$RELEASE_TAG" --json assets -q '.assets[].name'); do
+            [ -e "$a" ] || gh release delete-asset "$RELEASE_TAG" "$a" -y
+          done
